@@ -1,0 +1,10 @@
+snowflake-snowpark-python
+snowflake-connector-python
+pandas
+numpy
+requests
+openai
+fastapi
+gunicorn
+uvicorn
+

@@ -1,0 +1,26 @@
+spec:
+  containers:
+    - name: dti-fuel
+      image: /APP_ARTIFACTS_DEV/SPCS/DTI_FUEL_REPO/dti_fuel:1.1
+      env:
+        SNOWFLAKE_WAREHOUSE: DATAAI_X_SMALL
+        ENABLE_LLM_EXPLANATION: "true"
+      secrets:
+        - snowflakeSecret:
+            objectName: PROD_DOT_MLAI.DTI_FUEL.OPENAI_API_KEY
+          envVarName: OPENAI_API_KEY
+          secretKeyRef: secret_string
+
+        - snowflakeSecret:
+            objectName: PROD_DOT_MLAI.DTI_FUEL.PCMILER_API_KEY
+          envVarName: PCMILER_API_KEY
+          secretKeyRef: secret_string
+
+        - snowflakeSecret:
+            objectName: PROD_DOT_MLAI.DTI_FUEL.SAMSARA_API_KEY
+          envVarName: SAMSARA_API_KEY
+          secretKeyRef: secret_string
+  endpoints:
+    - name: api
+      port: 8080
+      public: true
