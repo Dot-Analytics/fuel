@@ -172,59 +172,79 @@ def parse_geotunnel_points(value: Any) -> List[Dict[str, Any]]:
     return parsed
 
 
-def build_state_events_from_geotunnel(points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not points:
+def parse_state_transitions(value: Any) -> List[Dict[str, Any]]:
+    transitions = _parse_json_maybe(value)
+    if not transitions:
         return []
+    parsed = []
+    for item in transitions:
+        if not isinstance(item, dict):
+            continue
+        mm = item.get("mm") or item.get("MM") or item.get("MM_APPROX_MI")
+        state = item.get("to_state") or item.get("state") or item.get("STATE")
+        lon = item.get("transition_lon") or item.get("lon") or item.get("LON")
+        lat = item.get("transition_lat") or item.get("lat") or item.get("LAT")
+        try:
+            mm = float(mm) if mm is not None else None
+        except (TypeError, ValueError):
+            mm = None
+        try:
+            lon = float(lon) if lon is not None else None
+            lat = float(lat) if lat is not None else None
+        except (TypeError, ValueError):
+            lon = None
+            lat = None
+        parsed.append({"mile_marker": mm, "state": normalize_state(state), "lon": lon, "lat": lat})
+    return parsed
+
+
+def build_state_events_from_transitions(
+    transitions: List[Dict[str, Any]],
+    origin_state: Optional[str],
+    dest_state: Optional[str],
+    distance_miles: float,
+) -> List[Dict[str, Any]]:
     events = []
-    cumulative_miles = 0.0
-    prev = None
-    last_state = None
-    for idx, point in enumerate(points):
-        lon = point.get("lon")
-        lat = point.get("lat")
-        state = point.get("state")
-        mm = point.get("mm")
-        if prev and prev.get("lat") is not None and prev.get("lon") is not None and lat is not None and lon is not None:
-            if mm is None or prev.get("mm") is None:
-                cumulative_miles += _haversine_miles(prev["lat"], prev["lon"], lat, lon)
-            else:
-                cumulative_miles = max(cumulative_miles, float(mm))
-        if state and state != last_state:
-            events.append(
-                {
-                    "event_seq": len(events) + 1,
-                    "mile_marker": cumulative_miles,
-                    "state": state,
-                    "event_type": "STATE",
-                    "location_type": "STATE",
-                }
-            )
-            last_state = state
-        if idx == 0 and state and not events:
-            events.append(
-                {
-                    "event_seq": 1,
-                    "mile_marker": 0.0,
-                    "state": state,
-                    "event_type": "STATE",
-                    "location_type": "STATE",
-                }
-            )
-            last_state = state
-        prev = point
-    last_mile_marker = cumulative_miles
-    if last_state is not None:
-        if not events or events[-1]["mile_marker"] < last_mile_marker:
-            events.append(
-                {
-                    "event_seq": len(events) + 1,
-                    "mile_marker": last_mile_marker,
-                    "state": last_state,
-                    "event_type": "END",
-                    "location_type": "END",
-                    "can_buy": False,
-                }
-            )
+    origin_state = normalize_state(origin_state)
+    dest_state = normalize_state(dest_state)
+    if origin_state:
+        events.append(
+            {
+                "event_seq": 1,
+                "mile_marker": 0.0,
+                "state": origin_state,
+                "event_type": "STATE",
+                "location_type": "STATE",
+            }
+        )
+    for transition in sorted(transitions, key=lambda t: (t.get("mile_marker") or 0.0)):
+        state = normalize_state(transition.get("state"))
+        if not state:
+            continue
+        events.append(
+            {
+                "event_seq": len(events) + 1,
+                "mile_marker": float(transition.get("mile_marker") or 0.0),
+                "state": state,
+                "event_type": "STATE",
+                "location_type": "STATE",
+                "lon": transition.get("lon"),
+                "lat": transition.get("lat"),
+            }
+        )
+    if distance_miles is None:
+        distance_miles = 0.0
+    end_state = dest_state or (events[-1]["state"] if events else origin_state)
+    events.append(
+        {
+            "event_seq": len(events) + 1,
+            "mile_marker": float(distance_miles),
+            "state": end_state,
+            "event_type": "END",
+            "location_type": "END",
+            "can_buy": False,
+        }
+    )
     return events
 
 
@@ -262,6 +282,7 @@ def _parse_stop_events(value: Any) -> List[Dict[str, Any]]:
         mm = item.get("mile_marker") or item.get("mm") or item.get("MM_APPROX_MI")
         event_type = str(item.get("event_type") or item.get("type") or "STOP").upper()
         location_type = "STOP"
+        price = item.get("price") or item.get("PRICE") or item.get("ppg") or item.get("PPG")
         if event_type in {"DC", "DISTRIBUTION_CENTER"}:
             location_type = "DC"
             event_type = "DC"
@@ -272,6 +293,10 @@ def _parse_stop_events(value: Any) -> List[Dict[str, Any]]:
             mm = float(mm)
         except (TypeError, ValueError):
             continue
+        try:
+            price = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
         out.append(
             {
                 "mile_marker": mm,
@@ -279,6 +304,7 @@ def _parse_stop_events(value: Any) -> List[Dict[str, Any]]:
                 "location_type": location_type,
                 "state": normalize_state(item.get("state") or item.get("STATE")),
                 "is_expected_stop": bool(item.get("is_expected_stop") or event_type in {"HOS", "BREAK", "REST"}),
+                "price": price,
             }
         )
     return out
@@ -304,6 +330,13 @@ def merge_events(state_events: List[Dict[str, Any]], stop_events: List[Dict[str,
             event["miles_to_next"] = max(0.0, float(deduped[idx + 1]["mile_marker"]) - float(event["mile_marker"]))
         else:
             event["miles_to_next"] = 0.0
+    last_state = None
+    for event in deduped:
+        state = normalize_state(event.get("state"))
+        if state:
+            last_state = state
+        elif last_state:
+            event["state"] = last_state
     return deduped
 
 
@@ -465,29 +498,19 @@ def run_fuel_model(
 
     plan_rows = []
     for _, lane in lanes_df.iterrows():
-        points = parse_geotunnel_points(lane.get("geotunnel_points") or lane.get("GEOTUNNEL_POINTS"))
-        state_events = build_state_events_from_geotunnel(points)
-        if not state_events:
-            origin_state = normalize_state(lane.get("origin_state") or lane.get("ORIGIN_STATE"))
-            dest_state = normalize_state(lane.get("dest_state") or lane.get("DEST_STATE"))
-            distance_miles = float(lane.get("distance_miles") or 0.0)
-            state_events = [
-                {
-                    "event_seq": 1,
-                    "mile_marker": 0.0,
-                    "state": origin_state,
-                    "event_type": "STATE",
-                    "location_type": "STATE",
-                },
-                {
-                    "event_seq": 2,
-                    "mile_marker": distance_miles,
-                    "state": dest_state or origin_state,
-                    "event_type": "END",
-                    "location_type": "END",
-                    "can_buy": False,
-                },
+        origin_state = normalize_state(lane.get("origin_state") or lane.get("ORIGIN_STATE"))
+        dest_state = normalize_state(lane.get("dest_state") or lane.get("DEST_STATE"))
+        distance_miles = float(lane.get("distance_miles") or 0.0)
+
+        transitions = parse_state_transitions(lane.get("state_transitions") or lane.get("STATE_TRANSITIONS"))
+        if not transitions:
+            points = parse_geotunnel_points(lane.get("geotunnel_points") or lane.get("GEOTUNNEL_POINTS"))
+            transitions = [
+                {"mile_marker": point.get("mm"), "state": point.get("state")}
+                for point in points
+                if point.get("state")
             ]
+        state_events = build_state_events_from_transitions(transitions, origin_state, dest_state, distance_miles)
 
         stop_events = _parse_stop_events(lane.get("stop_events") or lane.get("STOP_EVENTS"))
         events = merge_events(state_events, stop_events)
@@ -496,8 +519,8 @@ def run_fuel_model(
             state = normalize_state(event.get("state"))
             event["state"] = state
             event_price = state_price_map.get(state)
-            if event.get("location_type") == "DC" and lane.get("dc_price") is not None:
-                event_price = lane.get("dc_price")
+            if event.get("location_type") == "DC":
+                event_price = event.get("price") or lane.get("dc_price") or event_price
             if event_price is None:
                 event_price = lane.get("fuel_rate") or lane.get("FUEL_RATE")
             event["price"] = float(event_price) if event_price is not None else 0.0
