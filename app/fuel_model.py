@@ -8,18 +8,13 @@ Refactored from DTI_FUEL_POC.ipynb
 """
 
 import os
-import sys
 import json
 import math
 import time
-import heapq
-import re
-import urllib.parse
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Optional
 
 import pandas as pd
 import numpy as np
-import requests
 import openai
 import snowflake.connector
 
@@ -104,8 +99,324 @@ def call_openai(prompt: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# Core fuel / routing logic (THIS IS THE NOTEBOOK LOGIC)
+# Core fuel / routing logic (based on notebook concepts)
 # ---------------------------------------------------------------------
+
+GALLON_STEP = float(os.getenv("FUEL_GALLON_STEP", "1.0"))
+
+
+def _parse_json_maybe(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (list, dict)):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_miles = 3958.7613
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    return 2 * radius_miles * math.asin(math.sqrt(a))
+
+
+def _extract_point_fields(point: dict) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[float]]:
+    lon = point.get("lon") or point.get("LON") or point.get("longitude")
+    lat = point.get("lat") or point.get("LAT") or point.get("latitude")
+    state = point.get("state") or point.get("STATE") or point.get("state_abbr")
+    mm = point.get("mm") or point.get("MM") or point.get("mile") or point.get("MM_APPROX_MI")
+    try:
+        lon = float(lon) if lon is not None else None
+        lat = float(lat) if lat is not None else None
+    except (TypeError, ValueError):
+        lon = None
+        lat = None
+    try:
+        mm = float(mm) if mm is not None else None
+    except (TypeError, ValueError):
+        mm = None
+    return lon, lat, normalize_state(state) if state else None, mm
+
+
+def parse_geotunnel_points(value: Any) -> List[Dict[str, Any]]:
+    points = _parse_json_maybe(value)
+    if not points:
+        return []
+    parsed = []
+    for item in points:
+        if isinstance(item, dict):
+            lon, lat, state, mm = _extract_point_fields(item)
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            lon, lat = item[0], item[1]
+            try:
+                lon = float(lon)
+                lat = float(lat)
+            except (TypeError, ValueError):
+                continue
+            state = None
+            mm = None
+        else:
+            continue
+        parsed.append({"lon": lon, "lat": lat, "state": state, "mm": mm})
+    return parsed
+
+
+def parse_state_transitions(value: Any) -> List[Dict[str, Any]]:
+    transitions = _parse_json_maybe(value)
+    if not transitions:
+        return []
+    parsed = []
+    for item in transitions:
+        if not isinstance(item, dict):
+            continue
+        mm = item.get("mm") or item.get("MM") or item.get("MM_APPROX_MI")
+        state = item.get("to_state") or item.get("state") or item.get("STATE")
+        lon = item.get("transition_lon") or item.get("lon") or item.get("LON")
+        lat = item.get("transition_lat") or item.get("lat") or item.get("LAT")
+        try:
+            mm = float(mm) if mm is not None else None
+        except (TypeError, ValueError):
+            mm = None
+        try:
+            lon = float(lon) if lon is not None else None
+            lat = float(lat) if lat is not None else None
+        except (TypeError, ValueError):
+            lon = None
+            lat = None
+        parsed.append({"mile_marker": mm, "state": normalize_state(state), "lon": lon, "lat": lat})
+    return parsed
+
+
+def build_state_events_from_transitions(
+    transitions: List[Dict[str, Any]],
+    origin_state: Optional[str],
+    dest_state: Optional[str],
+    distance_miles: float,
+) -> List[Dict[str, Any]]:
+    events = []
+    origin_state = normalize_state(origin_state)
+    dest_state = normalize_state(dest_state)
+    if origin_state:
+        events.append(
+            {
+                "event_seq": 1,
+                "mile_marker": 0.0,
+                "state": origin_state,
+                "event_type": "STATE",
+                "location_type": "STATE",
+            }
+        )
+    for transition in sorted(transitions, key=lambda t: (t.get("mile_marker") or 0.0)):
+        state = normalize_state(transition.get("state"))
+        if not state:
+            continue
+        events.append(
+            {
+                "event_seq": len(events) + 1,
+                "mile_marker": float(transition.get("mile_marker") or 0.0),
+                "state": state,
+                "event_type": "STATE",
+                "location_type": "STATE",
+                "lon": transition.get("lon"),
+                "lat": transition.get("lat"),
+            }
+        )
+    if distance_miles is None:
+        distance_miles = 0.0
+    end_state = dest_state or (events[-1]["state"] if events else origin_state)
+    events.append(
+        {
+            "event_seq": len(events) + 1,
+            "mile_marker": float(distance_miles),
+            "state": end_state,
+            "event_type": "END",
+            "location_type": "END",
+            "can_buy": False,
+        }
+    )
+    return events
+
+
+def _detect_state_price_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+    if df is None or df.empty:
+        return None, None
+    cols = list(df.columns)
+    cols_u = [c.upper() for c in cols]
+    state_candidates = ["STATE", "STATE_ABBR", "STATE_CODE", "ST", "STATEPROV"]
+    price_candidates = ["RCSP", "PRICE", "PPG", "FUEL_PRICE", "DIESEL_PRICE", "STATE_PRICE"]
+    state_col = next((cols[cols_u.index(c)] for c in state_candidates if c in cols_u), None)
+    price_col = next((cols[cols_u.index(c)] for c in price_candidates if c in cols_u), None)
+    return state_col, price_col
+
+
+def build_state_price_map(fuel_costs_df: pd.DataFrame) -> Dict[str, float]:
+    state_col, price_col = _detect_state_price_columns(fuel_costs_df)
+    if not state_col or not price_col:
+        return {}
+    df = fuel_costs_df[[state_col, price_col]].copy()
+    df[state_col] = df[state_col].apply(normalize_state)
+    df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
+    df = df.dropna(subset=[state_col, price_col])
+    return df.groupby(state_col)[price_col].min().to_dict()
+
+
+def _parse_stop_events(value: Any) -> List[Dict[str, Any]]:
+    stops = _parse_json_maybe(value)
+    if not stops:
+        return []
+    out = []
+    for item in stops:
+        if not isinstance(item, dict):
+            continue
+        mm = item.get("mile_marker") or item.get("mm") or item.get("MM_APPROX_MI")
+        event_type = str(item.get("event_type") or item.get("type") or "STOP").upper()
+        location_type = "STOP"
+        price = item.get("price") or item.get("PRICE") or item.get("ppg") or item.get("PPG")
+        if event_type in {"DC", "DISTRIBUTION_CENTER"}:
+            location_type = "DC"
+            event_type = "DC"
+        elif event_type in {"HOS", "BREAK", "REST"}:
+            location_type = "HOS"
+            event_type = "STOP"
+        try:
+            mm = float(mm)
+        except (TypeError, ValueError):
+            continue
+        try:
+            price = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
+        out.append(
+            {
+                "mile_marker": mm,
+                "event_type": event_type,
+                "location_type": location_type,
+                "state": normalize_state(item.get("state") or item.get("STATE")),
+                "is_expected_stop": bool(item.get("is_expected_stop") or event_type in {"HOS", "BREAK", "REST"}),
+                "price": price,
+            }
+        )
+    return out
+
+
+def merge_events(state_events: List[Dict[str, Any]], stop_events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    events = state_events + stop_events
+    if not events:
+        return []
+    events.sort(key=lambda r: (r.get("mile_marker") or 0.0, r.get("event_type") or ""))
+    deduped = []
+    seen = set()
+    for event in events:
+        key = (round(float(event.get("mile_marker") or 0.0), 3), event.get("event_type"))
+        if key in seen:
+            continue
+        seen.add(key)
+        event["event_seq"] = len(deduped) + 1
+        event.setdefault("can_buy", True)
+        deduped.append(event)
+    for idx, event in enumerate(deduped):
+        if idx < len(deduped) - 1:
+            event["miles_to_next"] = max(0.0, float(deduped[idx + 1]["mile_marker"]) - float(event["mile_marker"]))
+        else:
+            event["miles_to_next"] = 0.0
+    last_state = None
+    for event in deduped:
+        state = normalize_state(event.get("state"))
+        if state:
+            last_state = state
+        elif last_state:
+            event["state"] = last_state
+    return deduped
+
+
+def optimize_fuel_plan_rcsp(
+    events: List[Dict[str, Any]],
+    initial_fuel: float,
+    mpg: float,
+    tank_capacity: float,
+    safety_buffer: float,
+    stop_fee: float,
+) -> Tuple[List[Tuple[int, float]], float]:
+    if not events:
+        return [], 0.0
+    mpg = max(mpg, 0.1)
+    step = max(GALLON_STEP, 0.1)
+    capacity = max(tank_capacity, step)
+    levels = np.arange(0.0, capacity + step / 2, step)
+    level_count = len(levels)
+    needed = []
+    for idx, event in enumerate(events):
+        gallons_needed = float(event.get("miles_to_next") or 0.0) / mpg
+        gallons_needed = math.ceil(gallons_needed / step) * step
+        buffer = safety_buffer if idx < len(events) - 1 else 0.0
+        needed.append(gallons_needed + buffer)
+
+    inf = float("inf")
+    costs = np.full(level_count, inf)
+    prev = [dict() for _ in range(len(events))]
+
+    start_fuel = min(max(initial_fuel, 0.0), capacity)
+    start_idx = int(round(start_fuel / step))
+    costs[start_idx] = 0.0
+
+    for idx, event in enumerate(events):
+        price = float(event.get("price") or 0.0)
+        location_type = str(event.get("location_type") or "").upper()
+        is_expected_stop = bool(event.get("is_expected_stop"))
+        fee_applies = location_type not in {"DC", "HOS"} and not is_expected_stop and stop_fee > 0
+        can_buy = bool(event.get("can_buy", True))
+        next_costs = np.full(level_count, inf)
+        next_prev = {}
+        for i, current_cost in enumerate(costs):
+            if current_cost == inf:
+                continue
+            current_fuel = levels[i]
+            for j in range(i, level_count):
+                target_fuel = levels[j]
+                buy_gallons = target_fuel - current_fuel
+                if buy_gallons > 0 and not can_buy:
+                    continue
+                extra_cost = buy_gallons * price
+                if buy_gallons > 0 and fee_applies:
+                    extra_cost += stop_fee
+                total_cost = current_cost + extra_cost
+                remaining = target_fuel - needed[idx]
+                if remaining < 0:
+                    continue
+                remaining = max(0.0, remaining)
+                remaining_idx = int(round(remaining / step))
+                if total_cost < next_costs[remaining_idx]:
+                    next_costs[remaining_idx] = total_cost
+                    next_prev[remaining_idx] = (i, buy_gallons)
+        costs = next_costs
+        prev[idx] = next_prev
+
+    end_idx = int(np.argmin(costs))
+    min_cost = float(costs[end_idx]) if costs[end_idx] != inf else 0.0
+
+    plan = []
+    cur_idx = end_idx
+    for idx in reversed(range(len(events))):
+        step_prev = prev[idx].get(cur_idx)
+        if not step_prev:
+            break
+        prev_idx, buy_gallons = step_prev
+        if buy_gallons > 0:
+            plan.append((events[idx]["event_seq"], round(float(buy_gallons), 2)))
+        cur_idx = prev_idx
+    plan.reverse()
+    return plan, min_cost
 
 def load_base_data(conn) -> Dict[str, pd.DataFrame]:
     """
@@ -145,28 +456,6 @@ def compute_lane_distance_costs(lanes_df: pd.DataFrame) -> pd.DataFrame:
     return lanes_df
 
 
-def score_lane(row: pd.Series) -> float:
-    """
-    Scoring heuristic from notebook.
-    """
-    score = 0.0
-
-    score += row.get("fuel_cost", 0.0)
-    score += row.get("toll_cost", 0.0)
-
-    if row.get("is_cross_border"):
-        score *= 1.15
-
-    return score
-
-
-def select_best_lanes(lanes_df: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
-    lanes_df = lanes_df.copy()
-    lanes_df["score"] = lanes_df.apply(score_lane, axis=1)
-
-    return lanes_df.sort_values("score").head(top_n)
-
-
 def lanes_to_records(lanes_df: pd.DataFrame) -> List[Dict[str, Any]]:
     sanitized = lanes_df.replace([np.nan, np.inf, -np.inf], None)
     return sanitized.to_dict(orient="records")
@@ -179,7 +468,12 @@ def lanes_to_records(lanes_df: pd.DataFrame) -> List[Dict[str, Any]]:
 def run_fuel_model(
     run_date: str,
     scenario: str = "default",
-    top_n: int = 5
+    top_n: int = 5,
+    mpg: float = 6.5,
+    tank_capacity: float = 200.0,
+    initial_fuel: float = 100.0,
+    safety_buffer: float = 10.0,
+    stop_fee: float = 100.0,
 ) -> Dict[str, Any]:
     """
     Main callable entrypoint.
@@ -198,15 +492,69 @@ def run_fuel_model(
     # 2. Compute costs
     lanes_df = compute_lane_distance_costs(lanes_df)
 
-    # 3. Select best lanes
-    best_lanes = select_best_lanes(lanes_df, top_n=top_n)
+    # 3. Build state price map (RCSP-style lowest price per state)
+    fuel_costs_df = datasets.get("fuel_costs")
+    state_price_map = build_state_price_map(fuel_costs_df)
+
+    plan_rows = []
+    for _, lane in lanes_df.iterrows():
+        origin_state = normalize_state(lane.get("origin_state") or lane.get("ORIGIN_STATE"))
+        dest_state = normalize_state(lane.get("dest_state") or lane.get("DEST_STATE"))
+        distance_miles = float(lane.get("distance_miles") or 0.0)
+
+        transitions = parse_state_transitions(lane.get("state_transitions") or lane.get("STATE_TRANSITIONS"))
+        if not transitions:
+            points = parse_geotunnel_points(lane.get("geotunnel_points") or lane.get("GEOTUNNEL_POINTS"))
+            transitions = [
+                {"mile_marker": point.get("mm"), "state": point.get("state")}
+                for point in points
+                if point.get("state")
+            ]
+        state_events = build_state_events_from_transitions(transitions, origin_state, dest_state, distance_miles)
+
+        stop_events = _parse_stop_events(lane.get("stop_events") or lane.get("STOP_EVENTS"))
+        events = merge_events(state_events, stop_events)
+
+        for event in events:
+            state = normalize_state(event.get("state"))
+            event["state"] = state
+            event_price = state_price_map.get(state)
+            if event.get("location_type") == "DC":
+                event_price = event.get("price") or lane.get("dc_price") or event_price
+            if event_price is None:
+                event_price = lane.get("fuel_rate") or lane.get("FUEL_RATE")
+            event["price"] = float(event_price) if event_price is not None else 0.0
+            if not event.get("can_buy", True):
+                event["price"] = 0.0
+            event["gallons_to_next"] = (float(event.get("miles_to_next") or 0.0) / max(mpg, 0.1))
+
+        plan, plan_cost = optimize_fuel_plan_rcsp(
+            events,
+            initial_fuel=initial_fuel,
+            mpg=mpg,
+            tank_capacity=tank_capacity,
+            safety_buffer=safety_buffer,
+            stop_fee=stop_fee,
+        )
+
+        plan_rows.append(
+            {
+                "lane": lane.to_dict(),
+                "events": events,
+                "fuel_plan": [{"event_seq": seq, "buy_gallons": gallons} for seq, gallons in plan],
+                "plan_cost": round(plan_cost, 2),
+            }
+        )
+
+    plan_rows.sort(key=lambda row: row.get("plan_cost") or 0.0)
+    best_plans = plan_rows[:top_n]
 
     # 4. Optional: LLM explanation
     explanation = None
     if os.getenv("ENABLE_LLM_EXPLANATION", "false").lower() == "true":
         prompt = f"""
-        Explain why these lanes were selected as optimal:
-        {best_lanes.to_dict(orient='records')}
+        Explain why these fuel plans were selected as optimal:
+        {best_plans}
         """
         explanation = call_openai(prompt)
 
@@ -216,7 +564,7 @@ def run_fuel_model(
         "run_date": run_date,
         "scenario": scenario,
         "elapsed_seconds": elapsed,
-        "lane_count": len(best_lanes),
-        "lanes": lanes_to_records(best_lanes),
+        "lane_count": len(best_plans),
+        "lanes": best_plans,
         "explanation": explanation,
     }
