@@ -167,6 +167,11 @@ def select_best_lanes(lanes_df: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
     return lanes_df.sort_values("score").head(top_n)
 
 
+def lanes_to_records(lanes_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    sanitized = lanes_df.replace([np.nan, np.inf, -np.inf], None)
+    return sanitized.to_dict(orient="records")
+
+
 # ---------------------------------------------------------------------
 # Main public entrypoint
 # ---------------------------------------------------------------------
@@ -212,7 +217,6 @@ def run_fuel_model(
         "scenario": scenario,
         "elapsed_seconds": elapsed,
         "lane_count": len(best_lanes),
-        "lanes": best_lanes.to_dict(orient="records"),
+        "lanes": lanes_to_records(best_lanes),
         "explanation": explanation,
     }
-
