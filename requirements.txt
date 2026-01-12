@@ -1,6 +1,5 @@
-snowflake-snowpark-python
-snowflake-connector-python
-pandas
+snowflake-snowpark-python[pandas]
+snowflake-connector-python[pandas]
 numpy
 requests
 openai
