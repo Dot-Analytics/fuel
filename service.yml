@@ -1,7 +1,7 @@
 spec:
   containers:
     - name: dti-fuel
-      image: /APP_ARTIFACTS_DEV/SPCS/DTI_FUEL_REPO/dti_fuel:1.1
+      image: /APP_ARTIFACTS_DEV/SPCS/DTI_FUEL_REPO/dti_fuel:1.3
       env:
         SNOWFLAKE_WAREHOUSE: DATAAI_X_SMALL
         ENABLE_LLM_EXPLANATION: "true"
